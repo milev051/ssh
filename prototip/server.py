@@ -162,7 +162,7 @@ def run_key_action(action: str, target: dict) -> dict[str, str]:
 
     if action == "activate-key":
         passphrase = str(target.get("passphrase", ""))
-        if not passphrase or any(c in passphrase for c in "\r\n\0"):
+        if any(c in passphrase for c in "\r\n\0"):
             raise ValueError("Unesi ispravan passphrase ključa.")
         result = run_with_askpass(["ssh-add", "-t", "43200", str(key_path)], passphrase, 1)
         if result.returncode:
@@ -175,8 +175,8 @@ def run_key_action(action: str, target: dict) -> dict[str, str]:
         raise RuntimeError("ssh-keygen nije pronađen na ovom računaru.")
 
     passphrase = str(target.get("passphrase", ""))
-    if len(passphrase) < 8 or len(passphrase) > 256 or any(c in passphrase for c in "\r\n\0"):
-        raise ValueError("Passphrase mora imati najmanje 8 znakova.")
+    if len(passphrase) > 256 or any(c in passphrase for c in "\r\n\0"):
+        raise ValueError("Passphrase može imati najviše 256 znakova i ne sme sadržati novi red.")
 
     nonce = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     temporary = key_path.with_name(f"{key_path.name}.new-{nonce}-{os.getpid()}")
