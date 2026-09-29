@@ -29,6 +29,10 @@ panel, prosleđuje samo lokalnom serveru za konkretnu operaciju i ne čuva se.
 Javni ključ možeš da kopiraš i dodaš u hosting panel. Panel ne može sam da
 opozove ključ u hostingu, pa ga pri brisanju ukloni i tamo.
 
+Aktivacija na macOS-u i Linuxu ističe posle 12 sati. Windows OpenSSH agent ne
+dobija rok važenja od aplikacije; ključ ostaje učitan dok se agent ne zaustavi
+ili se ključ ne ukloni.
+
 Brisanje korisnika traži unos korisničkog imena. Brisanje servera traži unos
 adrese. Akcija uklanja lokalni ključ i njegove rezervne kopije; za servere
 koji su definisani u lokalnom `serveri/` folderu uklanja i taj lokalni zapis.
