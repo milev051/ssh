@@ -164,17 +164,10 @@ def run_key_action(action: str, target: dict) -> dict[str, str]:
         passphrase = str(target.get("passphrase", ""))
         if any(c in passphrase for c in "\r\n\0"):
             raise ValueError("Unesi ispravan passphrase ključa.")
-        if os.name == "nt":
-            # Windows OpenSSH agents may reject keys when a lifetime is requested.
-            command = ["ssh-add", str(key_path)]
-            ttl_seconds = 0
-        else:
-            command = ["ssh-add", "-t", "43200", str(key_path)]
-            ttl_seconds = 43200
-        result = run_with_askpass(command, passphrase, 1)
+        result = run_with_askpass(["ssh-add", str(key_path)], passphrase, 1)
         if result.returncode:
             raise RuntimeError("Aktivacija nije uspela. Proveri passphrase i da li je ssh-agent pokrenut.")
-        return {"ok": "true", "ttl_seconds": str(ttl_seconds)}
+        return {"ok": "true"}
 
     if action != "create-key":
         raise ValueError("Nepoznata radnja.")
