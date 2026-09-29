@@ -1,0 +1,4 @@
+.DS_Store
+*.stari-*
+__pycache__/
+serveri/

@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Read one OpenSSH passphrase from the private inherited pipe."""
+
+import os
+import sys
+
+value = bytearray()
+fd = int(os.environ["SSH_UI_SECRET_FD"])
+while True:
+    chunk = os.read(fd, 1)
+    if not chunk or chunk == b"\n":
+        break
+    value.extend(chunk)
+sys.stdout.buffer.write(value)
