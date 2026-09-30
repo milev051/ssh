@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Dvoklik na Mac-u: pokreni lokalni SSH meni i otvori ga u pregledaču.
+# Dvoklik na Mac-u: pokreni skriveni lokalni server i otvori ga u pregledaču.
 d="${0:A:h}"
 cd "$d"
 if ! command -v python3 >/dev/null 2>&1; then
@@ -7,4 +7,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   read -r "?Pritisni Enter za zatvaranje..."
   exit 1
 fi
-exec python3 "$d/prototip/server.py"
+log_dir="$HOME/Library/Application Support/SSH UI"
+mkdir -p "$log_dir"
+nohup python3 "$d/prototip/server.py" >>"$log_dir/server.log" 2>&1 </dev/null &
+exit 0

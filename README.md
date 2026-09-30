@@ -11,6 +11,8 @@ ključ u `ssh-agent` i omogućava potvrđeno brisanje pristupa.
 
 Potrebni su Python 3 i OpenSSH Client. Pokretač otvara panel na
 `http://127.0.0.1:8765/`; lokalni server radi samo na ovom računaru.
+Server se pokreće u pozadini, a prozor pokretača se zatvara. Kada zatvoriš
+poslednji tab aplikacije, server se automatski gasi nakon oko 30 sekundi.
 
 ## Lokalni podaci
 

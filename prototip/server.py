@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +23,11 @@ WEB_ROOT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
 PORT = 8765
 KEY_LOCK = threading.Lock()
+CLIENT_LOCK = threading.Lock()
+ACTIVE_TABS: dict[str, float] = {}
+TAB_STALE_SECONDS = 300
+IDLE_SHUTDOWN_SECONDS = 30
+WATCHDOG_POLL_SECONDS = 2
 
 if os.name == "nt":
     APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "SSH UI"
@@ -360,6 +366,12 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
 
+    def log_message(self, format: str, *args) -> None:
+        if urlsplit(self.path).path in {"/api/heartbeat", "/api/tab-closed"}:
+            return
+        if sys.stderr is not None:
+            super().log_message(format, *args)
+
     def do_GET(self):
         if urlsplit(self.path).path == "/api/servers":
             payload = json.dumps(configured_targets(), ensure_ascii=False).encode("utf-8")
@@ -374,7 +386,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         action = urlsplit(self.path).path.removeprefix("/api/")
-        if action not in {"create-key", "activate-key", "delete-account", "delete-server"}:
+        if action not in {"create-key", "activate-key", "delete-account", "delete-server", "heartbeat", "tab-closed"}:
             self.send_error(404)
             return
         origin = self.headers.get("Origin")
@@ -391,7 +403,17 @@ class Handler(SimpleHTTPRequestHandler):
             target = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(target, dict):
                 raise ValueError("Neispravni podaci.")
-            if action in {"create-key", "activate-key"}:
+            if action in {"heartbeat", "tab-closed"}:
+                client_id = str(target.get("client_id", ""))
+                if not re.fullmatch(r"[a-f0-9-]{36}", client_id):
+                    raise ValueError("Neispravan identifikator taba.")
+                with CLIENT_LOCK:
+                    if action == "heartbeat":
+                        ACTIVE_TABS[client_id] = time.monotonic()
+                    else:
+                        ACTIVE_TABS.pop(client_id, None)
+                result = {"ok": "true"}
+            elif action in {"create-key", "activate-key"}:
                 result = run_key_action(action, target)
             elif action == "delete-account":
                 if target.get("source") == "repo":
@@ -418,13 +440,43 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(payload)
 
 
+def shutdown_when_idle(server: ThreadingHTTPServer) -> None:
+    idle_since = time.monotonic()
+    while True:
+        time.sleep(WATCHDOG_POLL_SECONDS)
+        now = time.monotonic()
+        with CLIENT_LOCK:
+            stale = [client_id for client_id, seen in ACTIVE_TABS.items() if now - seen > TAB_STALE_SECONDS]
+            for client_id in stale:
+                ACTIVE_TABS.pop(client_id, None)
+            if ACTIVE_TABS:
+                idle_since = None
+            elif idle_since is None:
+                idle_since = now
+            should_stop = idle_since is not None and now - idle_since >= IDLE_SHUTDOWN_SECONDS
+        if should_stop:
+            server.shutdown()
+            return
+
+
 if __name__ == "__main__":
+    if sys.stdout is None or sys.stderr is None:
+        ensure_local_data_dir()
+        log_file = (APP_DATA_DIR / "server.log").open("a", encoding="utf-8")
+        if sys.stdout is None:
+            sys.stdout = log_file
+        if sys.stderr is None:
+            sys.stderr = log_file
     address = f"http://{HOST}:{PORT}/"
-    print(f"SSH meni: {address}")
-    print("Za zaustavljanje zatvori ovaj prozor ili pritisni Ctrl+C.")
+    if sys.stdout is not None:
+        print(f"SSH meni: {address}")
+        print("Server se automatski gasi kada se zatvori poslednji tab.")
     threading.Timer(1, lambda: webbrowser.open(address)).start()
     try:
-        ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+        http_server = ThreadingHTTPServer((HOST, PORT), Handler)
+        threading.Thread(target=shutdown_when_idle, args=(http_server,), daemon=True).start()
+        http_server.serve_forever()
     except OSError as exc:
-        print(f"Ne mogu da pokrenem server na portu {PORT}: {exc}")
-        print("Proveri da li je SSH meni već pokrenut ili zatvori program koji koristi ovaj port.")
+        if sys.stderr is not None:
+            print(f"Ne mogu da pokrenem server na portu {PORT}: {exc}", file=sys.stderr)
+            print("Proveri da li je SSH meni već pokrenut ili zatvori program koji koristi ovaj port.", file=sys.stderr)
