@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 WEB_ROOT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
-PORT = 8765
+PORT = 0
 KEY_LOCK = threading.Lock()
 CLIENT_LOCK = threading.Lock()
 ACTIVE_TABS: dict[str, float] = {}
@@ -467,13 +467,14 @@ if __name__ == "__main__":
             sys.stdout = log_file
         if sys.stderr is None:
             sys.stderr = log_file
-    address = f"http://{HOST}:{PORT}/"
-    if sys.stdout is not None:
-        print(f"SSH meni: {address}")
-        print("Server se automatski gasi kada se zatvori poslednji tab.")
-    threading.Timer(1, lambda: webbrowser.open(address)).start()
     try:
         http_server = ThreadingHTTPServer((HOST, PORT), Handler)
+        PORT = http_server.server_address[1]
+        address = f"http://{HOST}:{PORT}/"
+        if sys.stdout is not None:
+            print(f"SSH meni: {address}")
+            print("Server se automatski gasi kada se zatvori poslednji tab.")
+        threading.Timer(1, lambda: webbrowser.open(address)).start()
         threading.Thread(target=shutdown_when_idle, args=(http_server,), daemon=True).start()
         http_server.serve_forever()
     except OSError as exc:
