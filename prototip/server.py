@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import webbrowser
 from datetime import datetime
@@ -23,11 +24,13 @@ WEB_ROOT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
 PORT = 0
 KEY_LOCK = threading.Lock()
+STATE_LOCK = threading.Lock()
 CLIENT_LOCK = threading.Lock()
 ACTIVE_TABS: dict[str, float] = {}
 TAB_STALE_SECONDS = 300
-IDLE_SHUTDOWN_SECONDS = 30
-WATCHDOG_POLL_SECONDS = 2
+IDLE_SHUTDOWN_SECONDS = 5
+STARTUP_SHUTDOWN_SECONDS = 30
+WATCHDOG_POLL_SECONDS = 1
 
 if os.name == "nt":
     APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "SSH UI"
@@ -46,6 +49,102 @@ def ensure_local_data_dir() -> None:
         os.chmod(APP_SERVER_DIR, 0o700)
     except OSError:
         pass
+
+
+def normalize_link(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    if value.startswith("//"):
+        value = "https:" + value
+    elif "://" not in value:
+        value = "https://" + value
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Unesi važeću adresu bez korisničkog imena i lozinke.")
+    if any(c.isspace() for c in value):
+        raise ValueError("Adresa ne sme sadržati razmake.")
+    return value
+
+
+def clean_state(payload: dict) -> dict:
+    def text_field(item: dict, name: str, default: str = "") -> str:
+        value = item.get(name, default)
+        if not isinstance(value, str) or len(value) > 2048 or any(c in value for c in "\r\n\0"):
+            raise ValueError("Neispravni podaci servera.")
+        return value
+
+    def account(item: dict, host: str, port: str) -> dict:
+        if not isinstance(item, dict):
+            raise ValueError("Neispravni podaci korisnika.")
+        user = text_field(item, "user")
+        identity_file_for("", user, host, port, "local")
+        return {"id": text_field(item, "id"), "user": user, "source": "local"}
+
+    hosts, users, panels = payload.get("hosts", []), payload.get("users", []), payload.get("panelUrls", {})
+    if not isinstance(hosts, list) or not isinstance(users, list) or not isinstance(panels, dict):
+        raise ValueError("Neispravni lokalni podaci.")
+    result = {"hosts": [], "users": [], "panelUrls": {}}
+    for item in hosts:
+        if not isinstance(item, dict) or not isinstance(item.get("accounts", []), list):
+            raise ValueError("Neispravni podaci servera.")
+        host, port = text_field(item, "host"), text_field(item, "port", "22")
+        if not re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", host) or not port.isdigit() or not 1 <= int(port) <= 65535:
+            raise ValueError("Neispravna adresa ili SSH port.")
+        result["hosts"].append({
+            "id": text_field(item, "id"), "host": host, "port": port, "source": "local",
+            "panelUrl": normalize_link(text_field(item, "panelUrl")),
+            "address": normalize_link(text_field(item, "address")),
+            "label": text_field(item, "label"),
+            "accounts": [account(a, host, port) for a in item.get("accounts", [])],
+        })
+    for item in users:
+        if not isinstance(item, dict):
+            raise ValueError("Neispravni podaci korisnika.")
+        host, port = text_field(item, "host"), text_field(item, "port", "22")
+        result["users"].append({"host": host, "port": port, "account": account(item.get("account"), host, port)})
+    for name, value in panels.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise ValueError("Neispravna adresa panela.")
+        result["panelUrls"][name] = normalize_link(value)
+    return result
+
+
+def save_local_state(payload: dict) -> None:
+    state = clean_state(payload)
+    ensure_local_data_dir()
+    with STATE_LOCK:
+        fd, temporary = tempfile.mkstemp(prefix=".podaci-", dir=APP_DATA_DIR)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(state, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, APP_DATA_DIR / "podaci.json")
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def load_local_state() -> dict | None:
+    ensure_local_data_dir()
+    with STATE_LOCK:
+        path = APP_DATA_DIR / "podaci.json"
+        if not path.exists():
+            return None
+        state = clean_state(json.loads(path.read_text(encoding="utf-8")))
+    try:
+        active = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True, timeout=2, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        active = ""
+    for host in state["hosts"] + [{"host": u["host"], "port": u["port"], "accounts": [u["account"]]} for u in state["users"]]:
+        for account in host["accounts"]:
+            key = identity_file_for("", account["user"], host["host"], host["port"], "local")
+            public = Path(f"{key}.pub")
+            account["publicKey"] = public.read_text(encoding="utf-8").strip() if key.is_file() and public.is_file() else ""
+            parts = account["publicKey"].split()
+            loaded = len(parts) >= 2 and any(line.split()[:2] == parts[:2] for line in active.splitlines())
+            account["key"] = "active" if loaded else "inactive" if key.is_file() else "none"
+    return state
 
 
 def configured_targets() -> list[dict[str, str | bool]]:
@@ -373,9 +472,15 @@ class Handler(SimpleHTTPRequestHandler):
             super().log_message(format, *args)
 
     def do_GET(self):
-        if urlsplit(self.path).path == "/api/servers":
-            payload = json.dumps(configured_targets(), ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
+        if urlsplit(self.path).path in {"/api/servers", "/api/state"}:
+            status = 200
+            try:
+                result = load_local_state() if urlsplit(self.path).path == "/api/state" else configured_targets()
+            except (OSError, ValueError) as exc:
+                result = {"error": f"Ne mogu da učitam lokalne podatke: {exc}"}
+                status = 500
+            payload = json.dumps(result, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")
@@ -386,7 +491,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         action = urlsplit(self.path).path.removeprefix("/api/")
-        if action not in {"create-key", "activate-key", "delete-account", "delete-server", "heartbeat", "tab-closed"}:
+        if action not in {"create-key", "activate-key", "delete-account", "delete-server", "heartbeat", "tab-closed", "save-state"}:
             self.send_error(404)
             return
         origin = self.headers.get("Origin")
@@ -398,7 +503,7 @@ class Handler(SimpleHTTPRequestHandler):
             if self.headers.get_content_type() != "application/json":
                 raise ValueError("Zahtev mora biti JSON sa lokalne aplikacije.")
             length = int(self.headers.get("Content-Length", "0"))
-            if not 1 <= length <= 16384:
+            if not 1 <= length <= (1048576 if action == "save-state" else 16384):
                 raise ValueError("Neispravan zahtev.")
             target = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(target, dict):
@@ -412,6 +517,9 @@ class Handler(SimpleHTTPRequestHandler):
                         ACTIVE_TABS[client_id] = time.monotonic()
                     else:
                         ACTIVE_TABS.pop(client_id, None)
+                result = {"ok": "true"}
+            elif action == "save-state":
+                save_local_state(target)
                 result = {"ok": "true"}
             elif action in {"create-key", "activate-key"}:
                 result = run_key_action(action, target)
@@ -442,6 +550,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 def shutdown_when_idle(server: ThreadingHTTPServer) -> None:
     idle_since = time.monotonic()
+    had_clients = False
     while True:
         time.sleep(WATCHDOG_POLL_SECONDS)
         now = time.monotonic()
@@ -450,10 +559,12 @@ def shutdown_when_idle(server: ThreadingHTTPServer) -> None:
             for client_id in stale:
                 ACTIVE_TABS.pop(client_id, None)
             if ACTIVE_TABS:
+                had_clients = True
                 idle_since = None
             elif idle_since is None:
                 idle_since = now
-            should_stop = idle_since is not None and now - idle_since >= IDLE_SHUTDOWN_SECONDS
+            timeout = IDLE_SHUTDOWN_SECONDS if had_clients else STARTUP_SHUTDOWN_SECONDS
+            should_stop = idle_since is not None and now - idle_since >= timeout
         if should_stop:
             server.shutdown()
             return
