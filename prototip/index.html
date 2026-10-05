@@ -59,10 +59,9 @@
         card.innerHTML=`<div class="key-top"><div><div class="key-title">SSH ključ ovog računara</div><div class="key-subtext">Ključ još nije kreiran na ovom računaru.</div></div><div class="key-badge none">Nema ključa</div></div><div class="key-actions"><button class="small-button main" id="createKeyBtn">Kreiraj SSH ključ</button></div>`;
         card.querySelector('#createKeyBtn').onclick=()=>createComputerKeyFlow();
       }else{
-        card.innerHTML=`<div class="key-top"><div><div class="key-title">SSH ključ ovog računara</div><div class="key-subtext">${esc(computerKey.path||computerKey.name)}</div></div><div class="key-badge ${computerKey.active?'active':''}">${computerKey.active?'Aktivan u sesiji':'Nije učitan'}</div></div>${computerKey.fingerprint?`<div class="key-details">Otisak: ${esc(computerKey.fingerprint)}</div>`:''}<div class="key-actions"><button class="small-button main" id="copyKeyBtn">Kopiraj javni ključ</button>${!computerKey.active?'<button class="small-button" id="activateKeyBtn">Aktiviraj ključ</button>':''}<button class="small-button" id="showKeyBtn">Prikaži ključ</button><button class="danger" id="deleteKeyBtn">Obriši ključ</button></div>`;
+        card.innerHTML=`<div class="key-top"><div><div class="key-title">SSH ključ ovog računara</div><div class="key-subtext">${esc(computerKey.path||computerKey.name)}</div></div><div class="key-badge ${computerKey.active?'active':''}">${computerKey.active?'Aktivan u sesiji':'Nije učitan'}</div></div><div class="key-actions"><button class="small-button main" id="copyKeyBtn">Kopiraj javni ključ</button>${!computerKey.active?'<button class="small-button" id="activateKeyBtn">Aktiviraj ključ</button>':''}<button class="danger" id="deleteKeyBtn">Obriši ključ</button></div>`;
         card.querySelector('#copyKeyBtn').onclick=()=>copyComputerPublicKey();
         if(card.querySelector('#activateKeyBtn'))card.querySelector('#activateKeyBtn').onclick=()=>activateComputerKeyFlow();
-        card.querySelector('#showKeyBtn').onclick=()=>showComputerPublicKey();
         card.querySelector('#deleteKeyBtn').onclick=()=>deleteComputerKeyFlow();
       }
     }
