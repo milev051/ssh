@@ -8,6 +8,7 @@ import hashlib
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -78,7 +79,8 @@ def clean_state(payload: dict) -> dict:
         if not isinstance(item, dict):
             raise ValueError("Neispravni podaci korisnika.")
         user = text_field(item, "user")
-        identity_file_for("", user, host, port, "local")
+        if not re.fullmatch(r"[A-Za-z0-9_.@+-]{1,100}", user):
+            raise ValueError("Neispravno korisničko ime.")
         return {"id": text_field(item, "id"), "user": user, "source": "local"}
 
     hosts, users, panels = payload.get("hosts", []), payload.get("users", []), payload.get("panelUrls", {})
@@ -132,18 +134,12 @@ def load_local_state() -> dict | None:
         if not path.exists():
             return None
         state = clean_state(json.loads(path.read_text(encoding="utf-8")))
-    try:
-        active = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True, timeout=2, check=False).stdout
-    except (OSError, subprocess.SubprocessError):
-        active = ""
+    computer_key = get_computer_key_info()
     for host in state["hosts"] + [{"host": u["host"], "port": u["port"], "accounts": [u["account"]]} for u in state["users"]]:
         for account in host["accounts"]:
-            key = identity_file_for("", account["user"], host["host"], host["port"], "local")
-            public = Path(f"{key}.pub")
-            account["publicKey"] = public.read_text(encoding="utf-8").strip() if key.is_file() and public.is_file() else ""
-            parts = account["publicKey"].split()
-            loaded = len(parts) >= 2 and any(line.split()[:2] == parts[:2] for line in active.splitlines())
-            account["key"] = "active" if loaded else "inactive" if key.is_file() else "none"
+            account["publicKey"] = computer_key["publicKey"]
+            account["key"] = "active" if computer_key["active"] else "inactive" if computer_key["exists"] else "none"
+    state["key"] = computer_key
     return state
 
 
@@ -214,50 +210,100 @@ def configured_targets() -> list[dict[str, str | bool]]:
     return targets
 
 
+def get_computer_key_path() -> Path:
+    ssh_dir = Path.home() / ".ssh"
+    std = ssh_dir / "id_ed25519"
+    if std.is_file():
+        return std
+    r211 = ssh_dir / "room211"
+    if r211.is_file():
+        return r211
+    return std
+
+
+def get_computer_key_info() -> dict:
+    key_path = get_computer_key_path()
+    public_path = Path(f"{key_path}.pub")
+    exists = key_path.is_file() and public_path.is_file()
+    if not exists:
+        return {
+            "exists": False,
+            "name": key_path.name,
+            "path": f"~/.ssh/{key_path.name}",
+            "publicKey": "",
+            "fingerprint": "",
+            "active": False,
+        }
+    try:
+        public_key = public_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        public_key = ""
+    fingerprint = ""
+    try:
+        res = subprocess.run(
+            ["ssh-keygen", "-lf", str(public_path)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        parts = res.stdout.split()
+        if len(parts) > 1:
+            fingerprint = parts[1]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    active = False
+    try:
+        res_agent = subprocess.run(
+            ["ssh-add", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if fingerprint and fingerprint in res_agent.stdout:
+            active = True
+        elif public_key:
+            parts = public_key.split()
+            if len(parts) >= 2:
+                active = any(line.split()[:2] == parts[:2] for line in res_agent.stdout.splitlines())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {
+        "exists": True,
+        "name": key_path.name,
+        "path": f"~/.ssh/{key_path.name}",
+        "publicKey": public_key,
+        "fingerprint": fingerprint,
+        "active": active,
+    }
+
+
 def identity_file_for(target_id: str, user: str, host: str, port: str, source: str) -> Path:
     ssh_dir = Path.home() / ".ssh"
-    if source == "repo":
-        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", target_id):
-            raise ValueError("Nepoznat server.")
+    if source == "repo" and target_id:
         config_path = APP_SERVER_DIR / target_id / "config"
-        if not config_path.is_file():
-            raise ValueError("Server nije pronađen u konfiguraciji.")
-        values: dict[str, str] = {}
-        in_host_block = False
-        for line in config_path.read_text(encoding="utf-8").splitlines():
-            match = re.match(r"^\s*Host\s+(\S+)\s*$", line, re.IGNORECASE)
-            if match:
-                in_host_block = match.group(1) == target_id
-                continue
-            if in_host_block:
-                match = re.match(r"^\s*(User|IdentityFile)\s+(\S+)", line, re.IGNORECASE)
+        if config_path.is_file():
+            values: dict[str, str] = {}
+            in_host_block = False
+            for line in config_path.read_text(encoding="utf-8").splitlines():
+                match = re.match(r"^\s*Host\s+(\S+)\s*$", line, re.IGNORECASE)
                 if match:
-                    values[match.group(1).lower()] = match.group(2)
-        if values.get("user") != user or "identityfile" not in values:
-            raise ValueError("Korisnik se ne poklapa sa konfiguracijom servera.")
-        key_path = Path(values["identityfile"]).expanduser()
-        if key_path.parent.resolve() != ssh_dir.resolve():
-            raise ValueError("Ključ mora biti sačuvan u lokalnom ~/.ssh folderu.")
-        return key_path
-
-    if not re.fullmatch(r"[A-Za-z0-9_.@+-]{1,100}", user):
-        raise ValueError("Neispravno korisničko ime.")
-    if not re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", host):
-        raise ValueError("Neispravna adresa servera.")
-    if not port.isdigit() or not 1 <= int(port) <= 65535:
-        raise ValueError("Neispravan SSH port.")
-    digest = hashlib.sha256(f"{host}\0{port}\0{user}".encode()).hexdigest()[:20]
-    return ssh_dir / f"ssh-ui-{digest}"
+                    in_host_block = match.group(1) == target_id
+                    continue
+                if in_host_block:
+                    match = re.match(r"^\s*(User|IdentityFile)\s+(\S+)", line, re.IGNORECASE)
+                    if match:
+                        values[match.group(1).lower()] = match.group(2)
+            if values.get("user") == user and "identityfile" in values:
+                key_path = Path(values["identityfile"]).expanduser()
+                if key_path.parent.resolve() == ssh_dir.resolve():
+                    return key_path
+    return get_computer_key_path()
 
 
 def run_key_action(action: str, target: dict) -> dict[str, str]:
-    key_path = identity_file_for(
-        str(target.get("target_id", "")),
-        str(target.get("user", "")),
-        str(target.get("host", "")),
-        str(target.get("port", "22")),
-        str(target.get("source", "local")),
-    )
+    key_path = get_computer_key_path()
     ssh_dir = key_path.parent
     ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
@@ -276,6 +322,8 @@ def run_key_action(action: str, target: dict) -> dict[str, str]:
 
     if action != "create-key":
         raise ValueError("Nepoznata radnja.")
+    if key_path.is_file() and Path(f"{key_path}.pub").is_file():
+        raise ValueError("SSH ključ već postoji na ovom računaru. Obriši ga pre pravljenja novog.")
     if not shutil.which("ssh-keygen"):
         raise RuntimeError("ssh-keygen nije pronađen na ovom računaru.")
 
@@ -288,7 +336,9 @@ def run_key_action(action: str, target: dict) -> dict[str, str]:
     temporary_public = Path(f"{temporary}.pub")
     archive = key_path.with_name(f"{key_path.name}.stari-{nonce}")
     archive_public = Path(f"{archive}.pub")
-    comment = f"{target.get('user', 'user')}@{target.get('host', 'server')}"
+    hostname = socket.gethostname().split(".")[0]
+    user = os.environ.get("USER", os.environ.get("USERNAME", "korisnik"))
+    comment = str(target.get("comment", "")).strip() or f"{user}@{hostname}"
 
     with KEY_LOCK:
         try:
@@ -330,6 +380,30 @@ def run_key_action(action: str, target: dict) -> dict[str, str]:
                     path.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+
+def delete_computer_key(target: dict) -> dict[str, str]:
+    key_path = get_computer_key_path()
+    pub_path = Path(f"{key_path}.pub")
+    if not key_path.is_file() and not pub_path.is_file():
+        raise ValueError("Ključ ne postoji.")
+    confirm = str(target.get("confirm", "")).strip()
+    if confirm != key_path.name and confirm != "obrisi":
+        raise ValueError(f"Unesi '{key_path.name}' za potvrdu brisanja.")
+    try:
+        if pub_path.is_file():
+            subprocess.run(["ssh-add", "-d", str(pub_path)], capture_output=True, timeout=2, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    nonce = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    archive = key_path.with_name(f"{key_path.name}.stari-{nonce}")
+    archive_pub = Path(f"{archive}.pub")
+    with KEY_LOCK:
+        if key_path.exists():
+            os.replace(key_path, archive)
+        if pub_path.exists():
+            os.replace(pub_path, archive_pub)
+    return {"ok": "true"}
 
 
 def run_with_askpass(command: list[str], passphrase: str, prompts: int) -> subprocess.CompletedProcess:
@@ -491,7 +565,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         action = urlsplit(self.path).path.removeprefix("/api/")
-        if action not in {"create-key", "activate-key", "delete-account", "delete-server", "heartbeat", "tab-closed", "save-state"}:
+        if action not in {"create-key", "activate-key", "delete-account", "delete-server", "heartbeat", "tab-closed", "save-state", "delete-key"}:
             self.send_error(404)
             return
         origin = self.headers.get("Origin")
@@ -523,11 +597,11 @@ class Handler(SimpleHTTPRequestHandler):
                 result = {"ok": "true"}
             elif action in {"create-key", "activate-key"}:
                 result = run_key_action(action, target)
+            elif action == "delete-key":
+                result = delete_computer_key(target)
             elif action == "delete-account":
                 if target.get("source") == "repo":
                     delete_config_target(target)
-                else:
-                    remove_local_identity(target)
                 result = {"ok": "true"}
             else:
                 delete_server_targets(target)
